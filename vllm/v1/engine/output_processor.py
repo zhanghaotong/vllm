@@ -657,6 +657,7 @@ class OutputProcessor:
                 )
                 if stop_string:
                     finish_reason = FinishReason.STOP
+                    engine_core_output.finish_reason = finish_reason
                     stop_reason = stop_string
 
                 # 3) Compute sample and prompt logprobs for request,
@@ -763,9 +764,13 @@ class OutputProcessor:
         ) as span:
             metrics = req_state.stats
             e2e_time = (
-                iteration_stats.iteration_timestamp - metrics.arrival_time
-                if iteration_stats
-                else time.time() - metrics.arrival_time
+                (
+                    iteration_stats.iteration_timestamp - metrics.arrival_time
+                    if iteration_stats
+                    else time.time() - metrics.arrival_time
+                )
+                if metrics.arrival_time
+                else 0
             )
             queued_time = metrics.scheduled_ts - metrics.queued_ts
             prefill_time = metrics.first_token_ts - metrics.scheduled_ts
