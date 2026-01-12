@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import json
+import time
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -20,7 +22,14 @@ from vllm.outputs import (
 )
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
-from vllm.tracing import SpanAttributes, SpanKind, Tracer, extract_trace_context
+from vllm.tracing import (
+    SpanAttributes,
+    SpanKind,
+    Status,
+    StatusCode,
+    Tracer,
+    extract_trace_context,
+)
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
@@ -144,6 +153,7 @@ class RequestState:
         n: int | None = None,
         temperature: float | None = None,
         stream_input: bool = False,
+        trace_headers: Mapping[str, str] | None = None,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -168,6 +178,7 @@ class RequestState:
         self.queue = queue
         self.num_cached_tokens = 0
 
+        self.trace_headers = trace_headers
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
         # Stream Interval
@@ -210,6 +221,7 @@ class RequestState:
         queue: RequestOutputCollector | None,
         log_stats: bool,
         stream_interval: int,
+        trace_headers: Mapping[str, str] | None = None,
     ) -> "RequestState":
         if sampling_params := request.sampling_params:
             if not sampling_params.detokenize:
@@ -259,6 +271,7 @@ class RequestState:
             log_stats=log_stats,
             stream_interval=stream_interval,
             stream_input=request.resumable,
+            trace_headers=trace_headers,
         )
 
     def make_request_output(
@@ -444,7 +457,12 @@ class OutputProcessor:
             assert state.queue is not None
             state.queue.put(e)
 
-    def abort_requests(self, request_ids: Iterable[str], internal: bool) -> list[str]:
+    def abort_requests(
+        self,
+        request_ids: Iterable[str],
+        internal: bool,
+        error: BaseException | None = None,
+    ) -> list[str]:
         """Abort a list of requests.
 
         The request_ids may be either external request IDs (those passed to
@@ -497,11 +515,15 @@ class OutputProcessor:
                     )
                 ):
                     req_state.queue.put(request_output)
+                if self.tracer:
+                    self.do_tracing(req_state=req_state, error=error)
             elif parent := self.parent_requests.get(request_id):
                 # Abort children prior to removing the parent.
                 if parent.child_requests:
                     child_reqs = list(parent.child_requests)
-                    child_reqs = self.abort_requests(child_reqs, internal=True)
+                    child_reqs = self.abort_requests(
+                        child_reqs, internal=True, error=error
+                    )
                     request_ids_to_abort.extend(child_reqs)
                 self.parent_requests.pop(request_id, None)
         if not self.request_states:
@@ -531,6 +553,7 @@ class OutputProcessor:
             queue=queue,
             log_stats=self.log_stats,
             stream_interval=self.stream_interval,
+            trace_headers=request.trace_headers,
         )
         if self._requests_drained.is_set():
             self._requests_drained.clear()
@@ -679,7 +702,11 @@ class OutputProcessor:
                         req_state, finish_reason, iteration_stats
                     )
                     if self.tracer:
-                        self.do_tracing(engine_core_output, req_state, iteration_stats)
+                        self.do_tracing(
+                            req_state=req_state,
+                            engine_core_output=engine_core_output,
+                            iteration_stats=iteration_stats,
+                        )
 
         return OutputProcessorOutput(
             request_outputs=request_outputs,
@@ -708,19 +735,26 @@ class OutputProcessor:
 
     def do_tracing(
         self,
-        engine_core_output: EngineCoreOutput,
         req_state: RequestState,
-        iteration_stats: IterationStats | None,
+        engine_core_output: EngineCoreOutput = None,
+        iteration_stats: IterationStats | None = None,
+        error: BaseException | None = None,
     ) -> None:
         assert req_state.stats is not None
-        assert iteration_stats is not None
         assert self.tracer is not None
 
         arrival_time_nano_seconds = int(req_state.stats.arrival_time * 1e9)
-        trace_context = extract_trace_context(engine_core_output.trace_headers)
+        trace_context = extract_trace_context(req_state.trace_headers)
         prompt_length = length_from_prompt_token_ids_or_embeds(
             req_state.prompt_token_ids, req_state.prompt_embeds
         )
+        finish_reasons = [
+            str(
+                engine_core_output.finish_reason
+                if engine_core_output
+                else FinishReason.ABORT
+            )
+        ]
         with self.tracer.start_as_current_span(
             "llm_request",
             kind=SpanKind.SERVER,
@@ -728,7 +762,11 @@ class OutputProcessor:
             start_time=arrival_time_nano_seconds,
         ) as span:
             metrics = req_state.stats
-            e2e_time = iteration_stats.iteration_timestamp - metrics.arrival_time
+            e2e_time = (
+                iteration_stats.iteration_timestamp - metrics.arrival_time
+                if iteration_stats
+                else time.time() - metrics.arrival_time
+            )
             queued_time = metrics.scheduled_ts - metrics.queued_ts
             prefill_time = metrics.first_token_ts - metrics.scheduled_ts
             decode_time = metrics.last_token_ts - metrics.first_token_ts
@@ -770,6 +808,15 @@ class OutputProcessor:
                 )
             if req_state.n:
                 span.set_attribute(SpanAttributes.GEN_AI_REQUEST_N, req_state.n)
+            span.set_attribute(
+                SpanAttributes.GEN_AI_RESPONSE_FINISH_REASON,
+                json.dumps(finish_reasons),
+            )
+            if error:
+                span.record_exception(error)
+                span.set_status(Status(StatusCode.ERROR, str(error)))
+            else:
+                span.set_status(Status(StatusCode.OK))
 
     def _update_stats_from_output(
         self,

@@ -18,7 +18,7 @@ try:
     from opentelemetry.sdk.environment_variables import (
         OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
     )
-    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace import Status, StatusCode, TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
     from opentelemetry.trace import SpanKind, Tracer, set_tracer_provider
     from opentelemetry.trace.propagation.tracecontext import (
@@ -45,6 +45,12 @@ except ImportError:
         pass
 
     class Tracer:  # type: ignore
+        pass
+
+    class Status:  # type: ignore
+        pass
+
+    class StatusCode:  # type: ignore
         pass
 
 
@@ -108,6 +114,7 @@ class SpanAttributes:
     GEN_AI_REQUEST_TOP_P = "gen_ai.request.top_p"
     GEN_AI_REQUEST_TEMPERATURE = "gen_ai.request.temperature"
     GEN_AI_RESPONSE_MODEL = "gen_ai.response.model"
+    GEN_AI_RESPONSE_FINISH_REASON = "gen_ai.response.finish_reasons"
     # Attribute names added until they are added to the semantic conventions:
     GEN_AI_REQUEST_ID = "gen_ai.request.id"
     GEN_AI_REQUEST_N = "gen_ai.request.n"
