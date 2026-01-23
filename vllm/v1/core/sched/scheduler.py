@@ -1981,7 +1981,7 @@ class Scheduler(SchedulerInterface):
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
-            if self.log_stats:
+            if self.vllm_config.observability_config.token_level_profiling:
                 request = self.requests.get(req_id)
                 if request is not None:
                     request.record_event(
@@ -1991,7 +1991,7 @@ class Scheduler(SchedulerInterface):
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
             assert req_id in self.requests
-            if self.log_stats:
+            if self.vllm_config.observability_config.token_level_profiling:
                 request = self.requests.get(req_id)
                 if request is not None:
                     request.record_event(
